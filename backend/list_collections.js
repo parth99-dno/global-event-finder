@@ -1,5 +1,5 @@
 const { MongoClient } = require('mongodb');
-const uri = process.env.MONGODB_URI || 'mongodb+srv://REDACTED@cluster0.gogzxe7.mongodb.net/global_event_finder?appName=Cluster0';
+const uri = process.env.MONGODB_URI;
 
 async function run() {
   const client = new MongoClient(uri);
