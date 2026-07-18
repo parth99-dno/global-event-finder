@@ -29,6 +29,11 @@ async function proxyPost(aiPath, req, res, overrideBody = null) {
 async function proxyGet(aiPath, res) {
   try {
     const upstream = await fetch(`${AI_BASE}${aiPath}`);
+    const contentType = upstream.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      // Upstream returned HTML (e.g. Render 502 page) — don't try to parse it
+      return res.status(502).json({ status: 'error', message: 'AI Service unreachable', detail: `Upstream returned non-JSON response (HTTP ${upstream.status})` });
+    }
     const data = await upstream.json();
     res.status(upstream.status).json(data);
   } catch (err) {

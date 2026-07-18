@@ -78,9 +78,9 @@ export default function Dashboard() {
       setLoadingRecs(true);
       
       const [eventsRes, mapEventsRes, trendingRes, recsRes] = await Promise.all([
-        api.get('/events?limit=6'),
-        api.get('/events?limit=200'),
-        api.get('/trending?top_n=6'),
+        api.get('/events?limit=6').catch(() => ({ data: { events: [] } })),
+        api.get('/events?limit=200').catch(() => ({ data: { events: [] } })),
+        api.get('/trending?top_n=6').catch(() => ({ data: { results: [] } })),
         api.get('/recommendations?top_n=4').catch(() => ({ data: { results: [] } }))
       ]);
 

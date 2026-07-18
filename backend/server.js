@@ -45,16 +45,27 @@ app.get('/', (req, res) => {
 });
 
 // Health check route
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
   const dbStatus = dbStates[mongoose.connection.readyState] || 'unknown';
+
+  let aiStatus = 'disconnected';
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    const aiRes = await fetch(`${process.env.AI_SERVICE_URL || 'http://localhost:8000'}/health`, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (aiRes.ok) aiStatus = 'connected';
+  } catch {
+    aiStatus = 'disconnected';
+  }
 
   res.json({
     status: 'UP',
     services: {
       backend: 'healthy',
       database: dbStatus,
-      aiService: 'disconnected' // will configure later
+      aiService: aiStatus
     }
   });
 });
