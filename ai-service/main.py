@@ -1,6 +1,7 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Query
+import threading
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ from ir.recommend import get_recommendations
 from ir.translate import translate_to_english
 from ml.trending import get_trending_topics
 from scripts.reclassify_uncategorized import reclassify_uncategorized_events
+import pipeline as pipeline_module
 
 # Load env variables
 load_dotenv()
@@ -34,7 +36,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic Schemas for Requests
+# ── Pipeline status (in-memory, reset on service restart) ─────────────────────
+_pipeline_lock = threading.Lock()
+_pipeline_status = {
+    "status": "idle",          # idle | running | error
+    "lastRunStart": None,
+    "lastRunEnd": None,
+    "lastRunSuccess": False,
+    "detail": ""
+}
+
+
+def _run_pipeline_in_background():
+    """
+    Run the full pipeline synchronously inside a FastAPI BackgroundTask thread.
+    Returns immediately to the caller so Render's 30-second timeout is never hit.
+    """
+    import datetime
+
+    with _pipeline_lock:
+        _pipeline_status["status"] = "running"
+        _pipeline_status["lastRunStart"] = datetime.datetime.utcnow().isoformat()
+        _pipeline_status["detail"] = ""
+
+    try:
+        logger.info("=== BACKGROUND PIPELINE STARTED ===")
+
+        # Step 1: fetch + NLP clean + insert new events into MongoDB
+        pipeline_module.run()
+        logger.info("pipeline.run() completed")
+
+        # Step 2: reclassify any events still marked 'Uncategorized' (non-fatal)
+        try:
+            reclassify_uncategorized_events()
+            logger.info("reclassify_uncategorized_events() completed")
+        except Exception as e:
+            logger.warning(f"Reclassification step failed (non-fatal): {e}")
+
+        # Step 3: rebuild TF-IDF search index in memory
+        load_and_index_events()
+        logger.info("Search index rebuilt")
+
+        with _pipeline_lock:
+            _pipeline_status["status"] = "idle"
+            _pipeline_status["lastRunEnd"] = datetime.datetime.utcnow().isoformat()
+            _pipeline_status["lastRunSuccess"] = True
+            _pipeline_status["detail"] = "Completed successfully"
+        logger.info("=== BACKGROUND PIPELINE COMPLETED ===")
+
+    except Exception as e:
+        import datetime as dt
+        logger.error(f"=== BACKGROUND PIPELINE FAILED: {e} ===")
+        with _pipeline_lock:
+            _pipeline_status["status"] = "error"
+            _pipeline_status["lastRunEnd"] = dt.datetime.utcnow().isoformat()
+            _pipeline_status["lastRunSuccess"] = False
+            _pipeline_status["detail"] = str(e)
+
+
+# ── Pydantic Schemas ───────────────────────────────────────────────────────────
+
 class ClassifyRequest(BaseModel):
     text: str = Field(..., description="The text content to classify into a category")
 
@@ -46,6 +107,9 @@ class TranslateRequest(BaseModel):
     query: str = Field(..., description="The original query string to translate")
     sourceLang: str = Field(..., description="The source language code (e.g. 'es', 'hi')")
 
+
+# ── Lifecycle ──────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 def startup_event():
     """Build the initial IR Search matrix on startup."""
@@ -54,6 +118,9 @@ def startup_event():
         load_and_index_events()
     except Exception as e:
         logger.error(f"Failed to load search index on startup: {e}")
+
+
+# ── Info routes ────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def read_root():
@@ -76,6 +143,31 @@ def health_check():
         "status": "healthy",
         "service": "ai-service"
     }
+
+
+# ── Pipeline endpoints ─────────────────────────────────────────────────────────
+
+@app.post("/run-pipeline")
+def run_pipeline_endpoint(background_tasks: BackgroundTasks):
+    """
+    Trigger the full data pipeline (fetch → NLP → insert → reindex) in the
+    background. Returns immediately so Render's 30-second request timeout is
+    never hit. Poll /pipeline-status to track progress.
+    """
+    with _pipeline_lock:
+        if _pipeline_status["status"] == "running":
+            return {"status": "running", "message": "Pipeline is already running."}
+
+    background_tasks.add_task(_run_pipeline_in_background)
+    return {"status": "started", "message": "Pipeline started in the background."}
+
+@app.get("/pipeline-status")
+def pipeline_status_endpoint():
+    """Return the current pipeline run status."""
+    return dict(_pipeline_status)
+
+
+# ── AI routes ──────────────────────────────────────────────────────────────────
 
 @app.post("/classify")
 def handle_classify(payload: ClassifyRequest):
